@@ -34,17 +34,50 @@ SLANG_PATH = shutil.which("slang") or (
 # "file:line: error: msg" / bare "file:line: syntax error" (icarus's
 # generic syntax-error line, always followed by a more specific "error:"
 # line at the same location — so one real icarus error is two matches
-# here, not one; MAX_DIAG_BLOCKS is set to 6 rather than 3 to compensate,
-# giving ~3 full icarus errors or 6 full slang diagnostics). Deliberately
-# does not match "note:" — a note is auxiliary info tied to the block
-# before it (e.g. "previous definition here"), so it stays folded into
-# that block instead of eating one of the kept slots.
+# here, not one; DEFAULT_MAX_DIAG_BLOCKS is set to 6 rather than 3 to
+# compensate, giving ~3 full icarus errors or 6 full slang diagnostics
+# at the baseline context size). Deliberately does not match "note:" — a
+# note is auxiliary info tied to the block before it (e.g. "previous
+# definition here"), so it stays folded into that block instead of
+# eating one of the kept slots.
 _DIAG_START_RE = re.compile(r"^\S+:\d+(?::\d+)?:\s*(?:(error|warning)\b|syntax error\b)", re.MULTILINE)
 _DIAG_IS_ERROR_RE = re.compile(r"^\S+:\d+(?::\d+)?:\s*(error\b|syntax error\b)")
-MAX_DIAG_BLOCKS = 6
+
+# Block cap tuned against config.py's own default num_ctx=8192 — configs
+# with a bigger/smaller context window scale this proportionally via
+# configure_diagnostics_budget() below rather than eating a fixed slice
+# of whatever num_ctx a given config actually has (a 6-block cap sized
+# for 8K tokens is needlessly stingy at 128K, and still oversized at a
+# genuinely tiny context).
+DEFAULT_MAX_DIAG_BLOCKS = 6
+_DIAG_BUDGET_BASELINE_NUM_CTX = 8192
+
+# Clamp bounds for the scaled value — floor keeps a tiny-context config
+# from truncating to the point of losing the single error that matters;
+# ceiling keeps a huge-context config from dumping so many diagnostic
+# blocks that they dominate the prompt on their own, since each slang
+# block also carries a source snippet + caret, not just one line.
+_MIN_DIAG_BLOCKS = 3
+_MAX_DIAG_BLOCKS_CEILING = 24
+
+# Mutable module-level budget, read live by _truncate_diagnostics() on
+# every call (not captured at function-definition time) — set once via
+# configure_diagnostics_budget(config.num_ctx) during agent startup
+# (see rtl_agent.py), so every build/lint call after that point uses the
+# budget for whichever config this process was actually launched with.
+_max_diag_blocks = DEFAULT_MAX_DIAG_BLOCKS
 
 
-def _truncate_diagnostics(stderr_log: str, max_blocks: int = MAX_DIAG_BLOCKS) -> str:
+def configure_diagnostics_budget(num_ctx: int) -> None:
+    """Scale the diagnostic-block truncation cap to the active config's num_ctx."""
+    global _max_diag_blocks
+    scaled = round(DEFAULT_MAX_DIAG_BLOCKS * num_ctx / _DIAG_BUDGET_BASELINE_NUM_CTX)
+    _max_diag_blocks = max(_MIN_DIAG_BLOCKS, min(scaled, _MAX_DIAG_BLOCKS_CEILING))
+
+
+def _truncate_diagnostics(stderr_log: str, max_blocks: int | None = None) -> str:
+    if max_blocks is None:
+        max_blocks = _max_diag_blocks
     # Both tools write every actual diagnostic to stderr (slang's stdout is
     # just a short fixed-size summary; icarus's stdout is empty), so
     # truncating stderr alone — before it's concatenated with stdout — caps

@@ -6,7 +6,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
 from config import DEFAULT_CONFIG_PATH, load_config
 from model import build_llm, build_system_prompt, FIX_PLAN_INSTRUCTION, PLANNING_INSTRUCTION
-from tools import BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS
+from tools import BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS, configure_diagnostics_budget
 
 # Windows terminals default to a codepage that can't render some characters —
 # force UTF-8 output so nothing gets garbled.
@@ -46,6 +46,11 @@ if args.model:
     # A one-off override shouldn't require writing a new YAML file — this
     # takes precedence over whatever the config file says.
     config = dataclasses.replace(config, model=args.model)
+
+# Scale the diagnostic-truncation budget to this run's actual context
+# window before any build/lint call happens — see tools.py for why a
+# fixed cap under- or over-truncates depending on num_ctx.
+configure_diagnostics_budget(config.num_ctx)
 
 # config.verilog_build_tool selects exactly one build/lint backend to bind
 # to the model — never both, since the point is picking one, not offering
