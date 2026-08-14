@@ -8,8 +8,19 @@ from langchain_core.tools import tool
 
 # Where the agent's RTL project lives. Kept separate from the script's own
 # directory so it can be freely cleared/gitignored without touching the
-# actual agent code.
-GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
+# actual agent code. Overridable via TIGRESSRTL_GENERATED_DIR so a
+# multi-worker caller (test/run_benchmark.py's --workers) can give each
+# concurrent rtl_agent.py subprocess its own isolated directory instead
+# of every worker sharing this one fixed path — build_verilog/lint_verilog
+# compile *every* .sv file under GENERATED_DIR together (see
+# _project_sv_files below), so two problems sharing this directory at the
+# same time would have one worker's build pick up another worker's
+# in-flight files. `or` (not a bare .get default) so an accidentally
+# empty-string env var also falls back to the real default rather than
+# resolving to the repo root.
+GENERATED_DIR = os.environ.get("TIGRESSRTL_GENERATED_DIR") or os.path.join(
+    os.path.dirname(__file__), "generated"
+)
 
 # Icarus Verilog's installer (unlike Ollama's) does not add itself to PATH,
 # so a bare "iverilog" call would fail even in a fresh terminal. Check PATH

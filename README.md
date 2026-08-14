@@ -166,6 +166,9 @@ python test/run_benchmark.py --dataset-dir verilog-eval/dataset_spec-to-rtl \
 
 # Quick smoke test — first 2 problems only
 python test/run_benchmark.py --dataset-dir verilog-eval/dataset_spec-to-rtl --configs configs/default.yaml --limit 2
+
+# Run 3 problems at once instead of one at a time — see --workers below
+python test/run_benchmark.py --dataset-dir verilog-eval/dataset_spec-to-rtl --configs configs/default.yaml --workers 3
 ```
 
 Each invocation runs every problem as a **fresh `rtl_agent.py` subprocess**
@@ -182,8 +185,21 @@ benchmark_runs/2026-08-04_23-45-28/
       transcript.log        # full agent output ([Plan]/[Action]/[Result]/[Auto-Build]/Assistant)
       status.json           # {problem, model, num_ctx, status, sv_file_count, duration_s,
                              #  input_tokens, output_tokens, total_tokens, ...}
-      generated/             # whatever ended up in src/generated/ after this run
+      generated/             # whatever that problem's rtl_agent.py subprocess wrote,
+                              # copied out of its own isolated temp dir after the run
 ```
+
+By default (`--workers 1`) problems run one at a time, exactly as before
+this flag existed. `--workers N` runs up to `N` (config, problem) pairs
+concurrently, each its own `rtl_agent.py` subprocess with its own isolated
+generated-files directory (a fresh `tempfile.mkdtemp()`, torn down after
+its output is copied into the run directory above) — so concurrent
+problems can never see or clobber each other's in-progress files. The
+real ceiling on useful concurrency is how many simultaneous requests your
+local Ollama server can actually serve well, not CPU count; start with a
+small value (2-4) and watch per-problem duration in the output before
+raising it further — past that ceiling, problems start queuing behind
+each other inside Ollama and `--workers` stops buying you anything.
 
 If a long sweep gets interrupted, resume it with
 `--resume-dir benchmark_runs/<timestamp>`, which skips any (config, problem)
