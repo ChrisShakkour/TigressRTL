@@ -6,7 +6,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
 from config import DEFAULT_CONFIG_PATH, load_config
 from model import build_llm, build_system_prompt, FIX_PLAN_INSTRUCTION, PLANNING_INSTRUCTION
-from tools import BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS
+from tools import BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS, load_project_memory
 
 # Windows terminals default to a codepage that can't render some characters —
 # force UTF-8 output so nothing gets garbled.
@@ -64,6 +64,22 @@ TOOL_FUNCTIONS = {t.name: t for t in TOOLS}
 llm = build_llm(config)
 llm_with_tools = llm.bind_tools(TOOLS)
 
+# Fold prior sessions' recorded conventions on this same project (see
+# tools.py's update_project_memory) into the system prompt, if any exist
+# yet — a fresh project (or a fresh benchmark-harness temp dir, which
+# never has one) just gets nothing appended here, no special-casing
+# needed. Loaded once at startup, not re-checked mid-session — the model
+# updates the in-context copy via update_project_memory the same way it
+# updates any other state during a session.
+project_memory = load_project_memory()
+system_prompt = build_system_prompt(active_build_tool_name)
+if project_memory:
+    system_prompt += (
+        "\n\nProject memory from earlier sessions on this project — "
+        "established conventions, follow them unless the user tells you "
+        "otherwise:\n\n" + project_memory
+    )
+
 # `messages` is the full conversation history sent on every request —
 # the API is stateless, so the whole transcript is resent each time. Each
 # turn is a typed message object:
@@ -71,9 +87,11 @@ llm_with_tools = llm.bind_tools(TOOLS)
 #   HumanMessage(...)  - you
 #   AIMessage(...)     - the model's turn (may carry .tool_calls)
 #   ToolMessage(...)   - a tool's result, tagged with which call it answers
-messages = [SystemMessage(content=build_system_prompt(active_build_tool_name))]
+messages = [SystemMessage(content=system_prompt)]
 
 print("Chatting with", config.model, "— a SystemVerilog RTL design assistant.")
+if project_memory:
+    print(f"[Memory] Loaded {len(project_memory)} characters of project memory.")
 print("Type 'exit' or 'quit' to stop.\n")
 
 while True:
@@ -151,8 +169,9 @@ while True:
                 print(
                     f"\nError: model '{config.model}' does not "
                     "support tool calling in Ollama.\nThis agent's tools (write_file, "
-                    f"read_file, edit_file_block, list_directory, {active_build_tool_name}) "
-                    "require a tool-capable model.\nTry --model llama3.2 instead — see "
+                    f"read_file, edit_file_block, list_directory, update_project_memory, "
+                    f"{active_build_tool_name}) require a tool-capable model.\nTry --model "
+                    "llama3.2 instead — see "
                     "README.md for what's been tested."
                 )
                 sys.exit(1)

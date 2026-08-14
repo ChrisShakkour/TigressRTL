@@ -120,8 +120,11 @@ up-counter with active-low reset and enable."*) and the agent will plan,
 write the file under `src/generated/`, and compile it automatically. Type
 `exit` or `quit` to stop.
 
-While it runs, three prefixes tell you what's actually happening:
+While it runs, a few prefixes tell you what's actually happening:
 
+- `[Memory]` — printed once at startup if this project already has a
+  `MEMORY.md` from an earlier session — see [Project memory](#project-memory)
+  below.
 - `[Plan]` — the model's stated plan, produced before any tool is available
   to it.
 - `[Action]` / `[Result]` — a tool call and its real return value.
@@ -130,6 +133,28 @@ While it runs, three prefixes tell you what's actually happening:
 
 Always trust `[Result]`/`[Auto-Build]` over the `Assistant:` text that
 follows — see [Design notes](#design-notes) below.
+
+## Project memory
+
+Each project (i.e. each `src/generated/` directory) can carry a persistent
+`MEMORY.md`, written by the agent itself via the `update_project_memory`
+tool. It's for conventions the model has already settled on for that
+project — reset polarity, module/port naming, bus widths, clock domain
+assumptions — so a later session on the same project doesn't quietly
+re-decide or contradict something already established. The system prompt
+tells the model to call `update_project_memory` whenever it sets or changes
+such a convention, passing the complete current content each time (the
+tool overwrites the file, it doesn't append).
+
+If `MEMORY.md` already exists when `rtl_agent.py` starts, its content is
+folded into the system prompt for that session (see `[Memory]` above) —
+loaded once at startup, not re-checked mid-session. There's nothing to
+configure: an empty or missing `MEMORY.md` is silently a no-op, which is
+also why this never affects `test/run_benchmark.py` — every benchmark
+problem run starts from a generated directory with no memory file in it
+(see [Benchmarking](#benchmarking) below for how that directory is
+cleared/isolated between problems), so benchmark runs stay exactly as
+history-free as before this feature existed.
 
 ## Config options
 
@@ -250,14 +275,16 @@ multi-file compile against the actual dataset testbench reflects the truth.
   a function rather than a constant, since the build-and-fix instructions
   it produces need to name whichever build tool is actually active.
 - **`src/tools.py`** — `BASE_TOOLS` (`write_file`, `read_file`,
-  `edit_file_block`, `list_directory` — always available) plus
-  `BUILD_TOOL_FUNCTIONS`/`BUILD_FAILURE_PREFIXES`, keyed by
+  `edit_file_block`, `list_directory`, `update_project_memory` — always
+  available) plus `BUILD_TOOL_FUNCTIONS`/`BUILD_FAILURE_PREFIXES`, keyed by
   `"icarus"`/`"slang"`: `build_verilog` and its structural sibling
   `lint_verilog` (Slang-backed). `AgentConfig.verilog_build_tool` selects
   exactly one to bind to the model — see
   [Build tools](configs/README.md#build-tools). All file-touching tools are
   sandboxed to `src/generated/` — a model-supplied path is untrusted input,
   normalized and checked so nothing can escape that directory.
+  `update_project_memory` writes `MEMORY.md` inside that same sandboxed
+  directory — see [Project memory](#project-memory) below.
 - **`src/rtl_agent.py`** — the interactive loop: resolves the active build
   tool from config once at startup, then a planning call with no tools
   bound (so the model is structurally unable to act before planning),

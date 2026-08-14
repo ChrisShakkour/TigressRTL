@@ -11,6 +11,14 @@ from langchain_core.tools import tool
 # actual agent code.
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
 
+# Persistent project memory, modeled on Hermes's MEMORY.md pattern (scaled
+# down — a flat file the model maintains directly via update_project_memory
+# below, no separate memory-provider subsystem). Lives inside GENERATED_DIR
+# so it travels with the project it describes and survives between
+# interactive rtl_agent.py sessions on the same project. .md, not .sv/.svh,
+# so _project_sv_files()'s *.sv glob never picks it up as a design file.
+MEMORY_FILENAME = "MEMORY.md"
+
 # Icarus Verilog's installer (unlike Ollama's) does not add itself to PATH,
 # so a bare "iverilog" call would fail even in a fresh terminal. Check PATH
 # first (covers Linux/macOS package managers, or a user who added it
@@ -260,6 +268,41 @@ def lint_verilog(file_path: str) -> str:
 
 
 @tool
+def update_project_memory(content: str) -> str:
+    """Overwrite this project's persistent memory file (MEMORY.md) with the given
+    complete Markdown content. Use it to record RTL design conventions this project
+    has already settled on -- reset polarity, module/port names, bus widths, clock
+    domains -- so a future session on this same project stays consistent instead of
+    re-deciding or contradicting them. Call this whenever you establish or change
+    such a convention. Always pass the full current state of what's worth
+    remembering, not just what changed -- this replaces the whole file, it does not
+    append."""
+    try:
+        target = Path(GENERATED_DIR).resolve() / MEMORY_FILENAME
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Same atomic write pattern as write_file — a crash mid-write can
+        # never leave a half-written MEMORY.md behind.
+        tmp_path = target.parent / (target.name + ".tmp")
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, target)
+        return f"Wrote {len(content)} characters to {MEMORY_FILENAME}"
+    except OSError as e:
+        return f"Failed to write {MEMORY_FILENAME}: {e}"
+
+
+def load_project_memory() -> str | None:
+    """Returns this project's current MEMORY.md content, or None if it doesn't
+    exist yet or is empty. Called once at rtl_agent.py startup to fold prior
+    sessions' recorded conventions into the system prompt — not a tool, since
+    the model doesn't choose when this happens."""
+    target = Path(GENERATED_DIR).resolve() / MEMORY_FILENAME
+    if not target.exists():
+        return None
+    content = target.read_text(encoding="utf-8").strip()
+    return content or None
+
+
+@tool
 def list_directory(path: str = ".") -> str:
     """List files and subdirectories at a path, to discover project structure, packages (.svh), and testbenches."""
     try:
@@ -282,7 +325,7 @@ def list_directory(path: str = ".") -> str:
 # "object is not callable"). The correct call is
 # TOOL_FUNCTIONS[name].invoke(args), passing the whole args dict rather
 # than unpacking it as keyword arguments (see rtl_agent.py).
-BASE_TOOLS = [write_file, read_file, edit_file_block, list_directory]
+BASE_TOOLS = [write_file, read_file, edit_file_block, list_directory, update_project_memory]
 
 # The two interchangeable build/lint backends — AgentConfig.verilog_build_tool
 # (see config.py) selects exactly one of these to bind to the model;
