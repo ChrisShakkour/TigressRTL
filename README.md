@@ -120,16 +120,50 @@ up-counter with active-low reset and enable."*) and the agent will plan,
 write the file under `src/generated/`, and compile it automatically. Type
 `exit` or `quit` to stop.
 
-While it runs, three prefixes tell you what's actually happening:
+While it runs, prefixes tell you what's actually happening:
 
 - `[Plan]` — the model's stated plan, produced before any tool is available
   to it.
 - `[Action]` / `[Result]` — a tool call and its real return value.
 - `[Auto-Build]` — the compilation result, run automatically after every
   write/edit.
+- `[Auto-Simulate]` — a real simulation run, automatically after a clean
+  build if the project has a testbench and icarus is active — see
+  [Verification](#verification) below.
 
-Always trust `[Result]`/`[Auto-Build]` over the `Assistant:` text that
-follows — see [Design notes](#design-notes) below.
+Always trust `[Result]`/`[Auto-Build]`/`[Auto-Simulate]` over the
+`Assistant:` text that follows — see [Design notes](#design-notes) below.
+
+## Verification
+
+`build_verilog` compiles with `-t null` — elaboration only, no simulation
+ever runs, so a clean build only proves the code compiles, not that it
+behaves correctly. `simulate_verilog` (icarus only — Slang is a
+compiler/linter with no simulator) closes that gap: it compiles to a real
+runnable target and executes it with `vvp`, so a testbench the model wrote
+actually gets run against the design, not just elaborated.
+
+This is enforced the same way builds already are. `src/tools.py`'s
+`project_has_testbench()` checks whether any `.sv` file in the project
+looks like a testbench by filename convention (e.g. `TopModule_tb.sv` —
+see [Design notes](#design-notes) for where that convention comes from). If
+one exists and icarus is active, `rtl_agent.py` auto-runs `simulate_verilog`
+right after every clean build, the same way it already auto-runs the build
+itself after every write/edit. `src/verify.py`'s `VerificationState` tracks
+whether that simulation has actually happened against the *current* files —
+a fresh build clears any earlier simulate evidence, since the files that
+evidence covered might not be the files just built — and the agent won't
+accept a final answer until it has, up to `config.max_build_retries`
+attempts, the same retry budget builds already use.
+
+One honest limitation: `simulate_verilog` proves the simulation *ran to
+completion*, not that the design is *correct*. An arbitrary model-authored
+testbench has no fixed pass/fail format this harness can parse (unlike
+`test/run_validation.py`'s dataset testbenches, which all end with a known
+`Mismatches: N in M samples` line) — so unlike a compile error, a testbench
+mismatch doesn't fail the tool call. Reading the real simulation output
+and judging correctness against it stays the model's job; this only
+guarantees that job wasn't skipped entirely.
 
 ## Config options
 
@@ -255,15 +289,26 @@ multi-file compile against the actual dataset testbench reflects the truth.
   `"icarus"`/`"slang"`: `build_verilog` and its structural sibling
   `lint_verilog` (Slang-backed). `AgentConfig.verilog_build_tool` selects
   exactly one to bind to the model — see
-  [Build tools](configs/README.md#build-tools). All file-touching tools are
-  sandboxed to `src/generated/` — a model-supplied path is untrusted input,
-  normalized and checked so nothing can escape that directory.
+  [Build tools](configs/README.md#build-tools). Also `simulate_verilog`, an
+  icarus-only extra tool (Slang has no simulator) that compiles to a real
+  runnable target and executes it with `vvp` — see
+  [Verification](#verification) below for why this exists and how it's
+  enforced. All file-touching tools are sandboxed to `src/generated/` — a
+  model-supplied path is untrusted input, normalized and checked so nothing
+  can escape that directory.
+- **`src/verify.py`** — `VerificationState`, a small dataclass that tracks
+  what's actually been proven about the current on-disk files within one
+  user turn (did the build pass, did a simulation run clean if this project
+  needs one) and knows how to explain what's still missing. Replaces a
+  handful of loose booleans that used to live directly in `rtl_agent.py`.
 - **`src/rtl_agent.py`** — the interactive loop: resolves the active build
   tool from config once at startup, then a planning call with no tools
   bound (so the model is structurally unable to act before planning),
   then a ReAct tool-calling loop that auto-runs the active build tool
-  after every write/edit and forces a bounded number of fix attempts
-  (`config.max_build_retries`) if a build fails.
+  after every write/edit — and, if the project has a testbench and icarus
+  is active, auto-runs `simulate_verilog` right after a clean build too —
+  and forces a bounded number of fix attempts (`config.max_build_retries`)
+  if verification isn't satisfied.
 - **`test/run_benchmark.py`** — sweeps `rtl_agent.py` (one fresh subprocess
   per problem) over the verilog-eval dataset across one or more configs —
   see [Benchmarking](#benchmarking) above.

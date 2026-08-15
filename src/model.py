@@ -9,12 +9,15 @@ from config import AgentConfig
 # than as constants here, so they're driven by the YAML config instead of
 # requiring a code edit to change.
 
-def build_system_prompt(build_tool_name: str) -> str:
+def build_system_prompt(build_tool_name: str, can_simulate: bool = False) -> str:
     # A function rather than a plain constant so the build/fix cycle it
     # describes always names whichever tool is actually bound
     # (config.verilog_build_tool in config.py) — build_verilog or
-    # lint_verilog — instead of hardcoding one.
-    return (
+    # lint_verilog — instead of hardcoding one. can_simulate is True only
+    # when icarus is active (see rtl_agent.py) — Slang has no simulator, so
+    # there's nothing to instruct the model to do with simulate_verilog when
+    # it isn't even bound.
+    prompt = (
         "You are an expert SystemVerilog RTL designer. Write clean, "
         "synthesizable RTL: use always_ff for sequential logic and "
         "always_comb or assign for combinational logic, and non-blocking assignments "
@@ -41,6 +44,19 @@ def build_system_prompt(build_tool_name: str) -> str:
         "final answer, and do not claim the code is correct or complete, "
         f"until {build_tool_name} has actually reported no errors."
     )
+    if can_simulate:
+        prompt += (
+            " If you write a testbench for this design (a second file that "
+            "instantiates it and checks its behavior), you must also call "
+            "simulate_verilog on the whole project and read its real output "
+            "before giving your final answer — a clean compile only proves "
+            "the code elaborates, not that the design behaves correctly. "
+            "simulate_verilog does not tell you pass or fail by itself; you "
+            "must read the testbench's own printed output and judge "
+            "correctness from that, the same way you already judge whether "
+            "compiler diagnostics are actually fixed."
+        )
+    return prompt
 
 # Used for the planning-phase call only (see rtl_agent.py) — no tools are
 # bound for that call, so the model is structurally unable to act yet no
@@ -53,16 +69,19 @@ PLANNING_INSTRUCTION = (
 )
 
 # Used for the fix-plan call only (see rtl_agent.py), triggered every time
-# an auto-build freshly fails — same structural guarantee as
+# a build/lint/simulate attempt freshly fails — same structural guarantee as
 # PLANNING_INSTRUCTION (no tools bound for this call), so the model can't
 # skip straight to another guessed edit without first diagnosing the
-# specific error in front of it.
+# specific error in front of it. Deliberately worded to cover all three —
+# src/verify.py's VerificationState sets fix_plan_pending from either a
+# failed build/lint or a failed simulate, so this single instruction has to
+# make sense for whichever one actually just happened.
 FIX_PLAN_INSTRUCTION = (
-    "The build/lint attempt above just failed. Before any tool is "
-    "available to you, write a short plan (2-4 bullet points): what "
-    "specifically the error log says is wrong, and the exact change "
-    "you'll make to fix it. Do not write SystemVerilog code yet — just "
-    "the plan, make sure to keep the signal names consistent with the original code"
+    "The build, lint, or simulation attempt above just failed. Before any "
+    "tool is available to you, write a short plan (2-4 bullet points): what "
+    "specifically the error or output above says is wrong, and the exact "
+    "change you'll make to fix it. Do not write SystemVerilog code yet — "
+    "just the plan, make sure to keep the signal names consistent with the original code"
 )
 
 

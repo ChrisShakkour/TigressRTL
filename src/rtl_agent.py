@@ -6,7 +6,11 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
 from config import DEFAULT_CONFIG_PATH, load_config
 from model import build_llm, build_system_prompt, FIX_PLAN_INSTRUCTION, PLANNING_INSTRUCTION
-from tools import BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS
+from tools import (
+    BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS,
+    SIMULATE_FAILURE_PREFIX, project_has_testbench, simulate_verilog,
+)
+from verify import VerificationState
 
 # Windows terminals default to a codepage that can't render some characters —
 # force UTF-8 output so nothing gets garbled.
@@ -54,7 +58,14 @@ if args.model:
 active_build_tool = BUILD_TOOL_FUNCTIONS[config.verilog_build_tool]
 active_build_tool_name = active_build_tool.name
 build_failure_prefix = BUILD_FAILURE_PREFIXES[config.verilog_build_tool]
-TOOLS = BASE_TOOLS + [active_build_tool]
+
+# simulate_verilog only makes sense with icarus — Slang is a compiler/linter,
+# it has no simulator to run at all. Bound as an extra tool alongside
+# active_build_tool, not through BUILD_TOOL_FUNCTIONS (that dict picks one
+# alternative *build* backend; this is an additional capability layered on
+# top of one specific backend, not a competing choice).
+can_simulate = config.verilog_build_tool == "icarus"
+TOOLS = BASE_TOOLS + [active_build_tool] + ([simulate_verilog] if can_simulate else [])
 TOOL_FUNCTIONS = {t.name: t for t in TOOLS}
 
 # `llm` is our handle to the model. `.bind_tools(TOOLS)` returns a new
@@ -71,7 +82,7 @@ llm_with_tools = llm.bind_tools(TOOLS)
 #   HumanMessage(...)  - you
 #   AIMessage(...)     - the model's turn (may carry .tool_calls)
 #   ToolMessage(...)   - a tool's result, tagged with which call it answers
-messages = [SystemMessage(content=build_system_prompt(active_build_tool_name))]
+messages = [SystemMessage(content=build_system_prompt(active_build_tool_name, can_simulate))]
 
 print("Chatting with", config.model, "— a SystemVerilog RTL design assistant.")
 print("Type 'exit' or 'quit' to stop.\n")
@@ -110,34 +121,28 @@ while True:
     # planning to acting.
     messages.append(HumanMessage(content="Proceed with your plan now, using the available tools."))
 
-    # Tracks whether the most recent auto-build (below) failed and hasn't
-    # been fixed yet, and how many times we've already nudged for a fix
-    # this turn — reset per user turn. See the retry check further down.
-    build_failed = False
-    build_retry_count = 0
-
-    # Set whenever an auto-build freshly fails (below), so the very next
-    # model turn gets a short, tools-unbound "diagnose and plan the fix"
-    # call first — same structural-guarantee pattern as the initial
-    # PLANNING_INSTRUCTION (a plain llm.invoke() with no tools bound, not a
-    # prompt hope), since local models have been observed diving straight
-    # into another guessed edit without pausing to actually read the error.
-    # Cleared once that plan call has been made, so a retry nudge (model
-    # skipped acting, not a fresh failure) doesn't trigger a second plan
-    # for the same error.
-    fix_plan_pending = False
+    # Tracks what's actually been proven about the current on-disk files
+    # this turn — build passed? simulated clean, if this project needs
+    # that? how many retries used? — reset per user turn. See verify.py.
+    verify_state = VerificationState()
 
     # Inner loop: the ReAct cycle for this one turn — keep calling the
     # model and executing whatever tools it requests until a response has
     # no more tool_calls, which is the model's final answer for this turn.
     while True:
-        if fix_plan_pending:
+        if verify_state.fix_plan_pending:
+            # Same structural-guarantee pattern as the initial
+            # PLANNING_INSTRUCTION (a plain llm.invoke() with no tools
+            # bound, not a prompt hope) — local models have been observed
+            # diving straight into another guessed edit without pausing to
+            # actually read the error, whether that error came from a
+            # build, a lint, or a simulation attempt.
             fix_plan_response = llm.invoke(messages + [HumanMessage(content=FIX_PLAN_INSTRUCTION)])
             accumulate_tokens(token_totals, fix_plan_response)
             print("[Fix Plan]", fix_plan_response.content, "\n")
             messages.append(fix_plan_response)
             messages.append(HumanMessage(content="Now apply that fix using the available tools."))
-            fix_plan_pending = False
+            verify_state.fix_plan_pending = False
 
         try:
             response = llm_with_tools.invoke(messages)
@@ -148,10 +153,10 @@ while True:
             # with an actionable message instead, since every subsequent
             # turn would hit the same wall.
             if "does not support tools" in str(e):
+                tool_names = ", ".join(t.name for t in TOOLS)
                 print(
                     f"\nError: model '{config.model}' does not "
-                    "support tool calling in Ollama.\nThis agent's tools (write_file, "
-                    f"read_file, edit_file_block, list_directory, {active_build_tool_name}) "
+                    f"support tool calling in Ollama.\nThis agent's tools ({tool_names}) "
                     "require a tool-capable model.\nTry --model llama3.2 instead — see "
                     "README.md for what's been tested."
                 )
@@ -164,23 +169,26 @@ while True:
         #   {"name": "write_file", "args": {...}, "id": "..."}
         if not response.tool_calls:
             # A response with no tool_calls is only treated as the real
-            # final answer if the last known build actually succeeded (or
-            # never ran). A model can correctly diagnose a build failure in
-            # prose, say it will fix it, and then simply not call
-            # write_file/edit_file_block in that same response — auto-build
-            # enforces that a failure is *seen*, but nothing forces it to be
-            # *acted on*. So otherwise, nudge for a genuine fix attempt and
+            # final answer if verify_state says nothing's missing: build
+            # passed, and simulate ran clean too if this project needs that
+            # (see project_has_testbench). A model can correctly diagnose a
+            # failure in prose, say it will fix it, and then simply not
+            # call the right tool in that same response — auto-build/
+            # auto-simulate enforce that a failure is *seen*, but nothing
+            # forces it to be *acted on*. Likewise a model can just forget
+            # to call simulate_verilog at all once a testbench exists,
+            # nothing failed, it just never tried. Either way: nudge and
             # keep the loop going, up to config.max_build_retries times.
-            if build_failed and build_retry_count < config.max_build_retries:
-                build_retry_count += 1
-                print(f"[Retry] Build is still failing and no fix was applied — "
-                      f"forcing attempt {build_retry_count}/{config.max_build_retries}.")
-                messages.append(HumanMessage(content=(
-                    f"The last {active_build_tool_name} result was a failure, and you "
-                    "did not call write_file or edit_file_block to actually apply a "
-                    "fix — you only described one. Call the appropriate tool now "
-                    "with the corrected content."
-                )))
+            simulate_required = can_simulate and project_has_testbench()
+            if verify_state.needs_retry(simulate_required, config.max_build_retries):
+                verify_state.retry_count += 1
+                reason = "Build/lint is still failing" if not verify_state.build_passed \
+                    else "A testbench hasn't been simulated yet"
+                print(f"[Retry] {reason} and no fix was applied — "
+                      f"forcing attempt {verify_state.retry_count}/{config.max_build_retries}.")
+                messages.append(HumanMessage(
+                    content=verify_state.nudge_message(active_build_tool_name, simulate_verilog.name)
+                ))
                 continue
             break  # model gave its final answer for this turn — inner loop ends
 
@@ -207,16 +215,32 @@ while True:
                 file_path = call["args"].get("file_path")
                 build_result = active_build_tool.invoke({"file_path": file_path})
                 print("[Auto-Build]", build_result)
-                # Drives the retry check above: a real, current failure sets
-                # this True; a successful build clears it (and resets the
-                # retry count) so a later, unrelated failure gets its own
-                # fresh set of attempts rather than inheriting an old count.
-                build_failed = build_result.startswith(build_failure_prefix)
-                if not build_failed:
-                    build_retry_count = 0
-                else:
-                    fix_plan_pending = True
+                build_passed = not build_result.startswith(build_failure_prefix)
+                verify_state.record_build(build_passed)
                 result = f"{result}\n\n[automatically ran {active_build_tool_name} after {name}]\n{build_result}"
+
+                # Same enforcement, one phase further: a clean build only
+                # proves the design elaborates, not that it behaves
+                # correctly, so if this project has a testbench and can
+                # actually simulate (icarus only — see can_simulate above),
+                # auto-run it too and fold its real output into the same
+                # tool response the model sees.
+                if build_passed and can_simulate and project_has_testbench():
+                    sim_result = simulate_verilog.invoke({})
+                    print("[Auto-Simulate]", sim_result)
+                    sim_ran_clean = not sim_result.startswith(SIMULATE_FAILURE_PREFIX)
+                    verify_state.record_simulate(sim_ran_clean)
+                    result = f"{result}\n\n[automatically ran simulate_verilog after a clean build]\n{sim_result}"
+
+            # The system prompt also tells the model to call build/lint or
+            # simulate itself — an explicit call (e.g. re-verifying without
+            # a fresh edit) has to update verify_state the same way an
+            # auto-triggered one does, or a failure from a model-initiated
+            # call would go unnoticed by the retry/fix-plan enforcement.
+            elif name == active_build_tool_name:
+                verify_state.record_build(not result.startswith(build_failure_prefix))
+            elif name == "simulate_verilog":
+                verify_state.record_simulate(not result.startswith(SIMULATE_FAILURE_PREFIX))
 
             # Print the tool's actual return value directly — never rely on
             # the model's own later paraphrase of it. Models have been

@@ -28,6 +28,16 @@ SLANG_PATH = shutil.which("slang") or (
     _SLANG_FALLBACK if os.path.exists(_SLANG_FALLBACK) else "slang"
 )
 
+# vvp ships alongside iverilog in the same install — same PATH-then-fallback
+# lookup, same reasoning as IVERILOG_PATH above. Only used by
+# simulate_verilog: build_verilog deliberately never runs vvp (-t null skips
+# producing a runnable target at all), so this is the one place an actual
+# simulation gets executed.
+_VVP_FALLBACK = r"C:\iverilog\bin\vvp.exe"
+VVP_PATH = shutil.which("vvp") or (
+    _VVP_FALLBACK if os.path.exists(_VVP_FALLBACK) else "vvp"
+)
+
 
 # Matches the start of one diagnostic from either tool: slang's
 # "file:line:col: error: msg" / "...warning: msg", or icarus's
@@ -75,6 +85,24 @@ def _project_sv_files() -> list[str]:
     # not compiled as standalone top-level units.
     base = Path(GENERATED_DIR).resolve()
     return sorted(str(p) for p in base.rglob("*.sv"))
+
+
+# Matches the self-authored-testbench naming convention this codebase's own
+# README already documents seeing in practice (e.g. TopModule_tb.sv) plus a
+# couple of common variants — a filename heuristic, not a content check,
+# since a testbench's actual content (a module with no ports that
+# instantiates another module) isn't reliably distinguishable from other
+# valid SystemVerilog without real parsing.
+_TESTBENCH_NAME_RE = re.compile(r"(^tb_|_tb$|testbench)", re.IGNORECASE)
+
+
+def project_has_testbench() -> bool:
+    """True if any .sv file currently in the project looks like a testbench by
+    filename convention. Used to decide whether simulate_verilog should be
+    auto-run/required for this turn's verification — most generated modules
+    have no testbench yet and shouldn't be forced through a simulate step
+    that would just fail with nothing to instantiate."""
+    return any(_TESTBENCH_NAME_RE.search(Path(f).stem) for f in _project_sv_files())
 
 
 def _resolve_safe_path(path: str) -> Path:
@@ -257,6 +285,91 @@ def lint_verilog(file_path: str) -> str:
         return f"Lint of {file_path} timed out after 30s."
     except (OSError, ValueError) as e:
         return f"Failed to lint {file_path}: {e}"
+
+
+# Distinct from BUILD_FAILURE_PREFIXES below — this tool has its own single
+# failure mode string regardless of build backend, since it's only ever
+# bound when icarus is active (Slang has no simulator to run at all).
+SIMULATE_FAILURE_PREFIX = "Simulation failed"
+_SIM_OUTPUT_FILENAME = "sim.vvp"
+
+# A testbench's own printed output has no fixed structure this harness can
+# parse (unlike test/run_validation.py's dataset testbenches, which all end
+# with a known "Mismatches: N in M samples" line) — so unlike
+# _truncate_diagnostics above, which preserves whole diagnostic blocks, this
+# is a plain tail truncation: a testbench's final pass/fail summary is
+# almost always printed last, so that's the part worth keeping if a verbose
+# run has to be cut. Deliberately a fixed constant, independent of any
+# num_ctx-based scaling — this tool is self-contained.
+_MAX_SIM_OUTPUT_CHARS = 4000
+
+
+def _truncate_sim_output(output: str, max_chars: int = _MAX_SIM_OUTPUT_CHARS) -> str:
+    if len(output) <= max_chars:
+        return output
+    omitted = len(output) - max_chars
+    return f"... ({omitted} earlier character(s) omitted) ...\n" + output[-max_chars:]
+
+
+@tool
+def simulate_verilog() -> str:
+    """Compile every .sv file in the project to a real Icarus Verilog simulation
+    target (not just an elaboration check) and run it with vvp, executing any
+    testbench present. Only meaningful when icarus is the active build tool —
+    Slang is a compiler/linter, it has no simulator. This proves the simulation
+    ran to completion; it does NOT by itself prove the design is functionally
+    correct — read the real output returned here (the testbench's own printed
+    results, any mismatches or assertion failures) and judge correctness from
+    that yourself, the same way you already judge whether compiler diagnostics
+    are actually fixed."""
+    sv_files = _project_sv_files()
+    if not sv_files:
+        return f"{SIMULATE_FAILURE_PREFIX}: no .sv files found in the project to simulate."
+
+    sim_output = Path(GENERATED_DIR).resolve() / _SIM_OUTPUT_FILENAME
+    try:
+        # Step 1: compile to a real runnable target (no -t null this time —
+        # that flag is specifically what makes build_verilog elaborate
+        # without producing anything runnable). Same multi-file compile as
+        # build_verilog/lint_verilog, same reasoning: a self-authored
+        # testbench in a second file needs every other file present to
+        # resolve the module it instantiates.
+        compile_result = subprocess.run(
+            [IVERILOG_PATH, "-g2012", "-o", str(sim_output), *sv_files],
+            capture_output=True, text=True, timeout=30,
+        )
+        if compile_result.returncode != 0:
+            log = (compile_result.stdout + _truncate_diagnostics(compile_result.stderr)).strip()
+            return f"{SIMULATE_FAILURE_PREFIX} (compile exit code {compile_result.returncode}):\n{log}"
+
+        # Step 2: actually run it.
+        run_result = subprocess.run(
+            [VVP_PATH, str(sim_output)], capture_output=True, text=True, timeout=30,
+        )
+        log = _truncate_sim_output((run_result.stdout + run_result.stderr).strip())
+        if run_result.returncode != 0:
+            # A nonzero exit here means the simulation itself crashed or hit
+            # a $fatal — a real, fixable problem, tracked as a failure the
+            # same way a compile error is. It does NOT mean "the testbench
+            # reported a mismatch" — most testbenches print their result and
+            # exit 0 regardless of pass/fail, which is exactly why a clean
+            # run below still isn't proof of correctness.
+            return f"{SIMULATE_FAILURE_PREFIX} (simulation exit code {run_result.returncode}):\n{log}"
+        return f"Simulation completed. Raw output below — check it yourself for pass/fail:\n{log}"
+
+    except FileNotFoundError:
+        return (
+            f"{SIMULATE_FAILURE_PREFIX}: iverilog or vvp is not installed or could not be "
+            "found. Install Icarus Verilog and ensure both iverilog and vvp are on PATH."
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"{SIMULATE_FAILURE_PREFIX}: timed out after 30s. If the testbench has no "
+            "$finish and no simulated-time cutoff of its own, it can run forever in real "
+            "time — add one."
+        )
+    except OSError as e:
+        return f"{SIMULATE_FAILURE_PREFIX}: {e}"
 
 
 @tool

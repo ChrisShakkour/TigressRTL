@@ -7,7 +7,7 @@ fields defined by `AgentConfig` in `src/config.py`:
 |---|---|---|
 | `model` | `devstral` | Which pulled Ollama model to use. |
 | `num_ctx` | `8192` | Context window size, in tokens, given to Ollama. Can be set anywhere up to the chosen model's maximum context length (see table below) — larger values use more RAM/VRAM and run slower. |
-| `max_build_retries` | `3` | How many times the agent is forced to retry after a build failure it didn't actually fix, before giving up for that turn. Any non-negative integer. |
+| `max_build_retries` | `3` | How many times the agent is forced to retry after verification isn't satisfied (a build/lint failure it didn't actually fix, or — with icarus — a testbench it never simulated), before giving up for that turn. Any non-negative integer. See [Verification](../README.md#verification) in the root README. |
 | `verilog_build_tool` | `icarus` | Which build/lint backend the agent's build tool uses: `icarus` (Icarus Verilog, a real compiler — `build_verilog`) or `slang` (sv-lang.com, a stricter linter — `lint_verilog`). Exactly one is bound to the model at a time, never both. An invalid value raises a clear error immediately. See [Build tools](#build-tools) below. |
 
 To run an experiment with different settings, copy `default.yaml`, edit the
@@ -21,8 +21,8 @@ of silently falling back to the wrong default — see `load_config()` in
 
 | `verilog_build_tool` | Real tool | Notes |
 |---|---|---|
-| `icarus` (default) | Icarus Verilog | Compiles to a real simulation target (`-t null` here — elaboration only, no simulation actually run). Silent on success. |
-| `slang` | Slang (sv-lang.com) | `lint_verilog` runs it with `-Weverything`, which catches real issues Icarus misses entirely — e.g. it flagged a genuine width mismatch (`-Warith-op-mismatch`) on a file Icarus compiled clean with zero warnings. Always prints a `Build succeeded/failed: N errors, M warnings` summary, even on success. |
+| `icarus` (default) | Icarus Verilog | `build_verilog` compiles to `-t null` — elaboration only, no simulation actually run. Silent on success. Also the only setting that binds `simulate_verilog`, which compiles to a real runnable target and executes it with `vvp` — see [Verification](../README.md#verification) in the root README. |
+| `slang` | Slang (sv-lang.com) | `lint_verilog` runs it with `-Weverything`, which catches real issues Icarus misses entirely — e.g. it flagged a genuine width mismatch (`-Warith-op-mismatch`) on a file Icarus compiled clean with zero warnings. Always prints a `Build succeeded/failed: N errors, M warnings` summary, even on success. Slang has no simulator, so `simulate_verilog` is never bound under this setting. |
 
 Both share the same sandboxing, 30s timeout, and error handling in
 `src/tools.py` — switching `verilog_build_tool` doesn't change anything else
