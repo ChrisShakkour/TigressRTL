@@ -242,31 +242,64 @@ multi-file compile against the actual dataset testbench reflects the truth.
 ## Architecture
 
 - **`src/config.py`** / **`configs/default.yaml`** — `AgentConfig`, a small
-  dataclass (`model`, `num_ctx`, `max_build_retries`, `verilog_build_tool`)
-  loaded from YAML via `load_config()`. The single source of truth for
-  experiment settings — see [Run](#run) above.
+  dataclass (`model`, `num_ctx`, `max_build_retries`, `verilog_build_tool`,
+  `enable_simulation`, `max_sim_retries`, `sim_debug_window_cycles`) loaded
+  from YAML via `load_config()`. The single source of truth for experiment
+  settings — see [Run](#run) above.
 - **`src/model.py`** — the one swappable model/provider point (`build_llm()`
-  takes an `AgentConfig`), plus `build_system_prompt(build_tool_name)` —
-  a function rather than a constant, since the build-and-fix instructions
-  it produces need to name whichever build tool is actually active.
+  takes an `AgentConfig`), plus
+  `build_system_prompt(build_tool_name, enable_simulation)` — a function
+  rather than a constant, since the build-and-fix (and, when enabled,
+  simulate-and-fix) instructions it produces need to name whichever tools
+  are actually bound.
 - **`src/tools.py`** — `BASE_TOOLS` (`write_file`, `read_file`,
   `edit_file_block`, `list_directory` — always available) plus
   `BUILD_TOOL_FUNCTIONS`/`BUILD_FAILURE_PREFIXES`, keyed by
   `"icarus"`/`"slang"`: `build_verilog` and its structural sibling
   `lint_verilog` (Slang-backed). `AgentConfig.verilog_build_tool` selects
   exactly one to bind to the model — see
-  [Build tools](configs/README.md#build-tools). All file-touching tools are
+  [Build tools](configs/README.md#build-tools). Also
+  `make_run_simulation_tool(debug_window_cycles)`, a factory (not a bare
+  `@tool`, since the VCD window size is config-driven but must stay out of
+  the tool's LLM-visible schema) for `run_simulation` — compiles the whole
+  project to a real runnable target with `iverilog -o` + `vvp` and renders a
+  VCD-derived signal-value window around a failure via `src/vcd.py`. Only
+  bound at all when `AgentConfig.enable_simulation` is true — see
+  [Simulation](configs/README.md#simulation). All file-touching tools are
   sandboxed to `src/generated/` — a model-supplied path is untrusted input,
   normalized and checked so nothing can escape that directory.
+  `run_simulation`'s own compile step additionally reads (never through any
+  model-facing tool) from `SIM_EXTRAS_DIR` (`src/sim_extras/`), a sibling
+  directory `_resolve_safe_path` structurally cannot reach — used by
+  `test/run_benchmark.py` to supply a real verilog-eval testbench+reference
+  pair without ever exposing the reference solution to the model; see
+  [Simulation](configs/README.md#simulation) for how the VCD debug window
+  filters out the reference module's own `_ref`-suffixed signals whenever
+  this directory is involved, rather than suppressing the window outright.
+- **`src/vcd.py`** — a small, dependency-free VCD (waveform dump) parser:
+  `parse_vcd()` reads a `.vcd` file into per-signal `(time, value)` traces,
+  `find_clock_period()` detects a `clk`/`clock` signal's cycle length, and
+  `render_window()` renders every signal's value across N clock cycles
+  around a given timestamp — the debug context `run_simulation` hands the
+  model on a failure.
 - **`src/rtl_agent.py`** — the interactive loop: resolves the active build
   tool from config once at startup, then a planning call with no tools
   bound (so the model is structurally unable to act before planning),
   then a ReAct tool-calling loop that auto-runs the active build tool
   after every write/edit and forces a bounded number of fix attempts
-  (`config.max_build_retries`) if a build fails.
+  (`config.max_build_retries`) if a build fails. When
+  `config.enable_simulation` is true, a build that just passed also
+  auto-chains `run_simulation` (the actual "only once the build is passing"
+  gate — the call site is physically inside the build-succeeded branch, not
+  left to the model to time correctly), with the same forced-retry
+  discipline (`config.max_sim_retries`) for a runtime failure.
 - **`test/run_benchmark.py`** — sweeps `rtl_agent.py` (one fresh subprocess
   per problem) over the verilog-eval dataset across one or more configs —
-  see [Benchmarking](#benchmarking) above.
+  see [Benchmarking](#benchmarking) above. For a config with
+  `enable_simulation: true`, also clears and repopulates `SIM_EXTRAS_DIR`
+  with that problem's real `_test.sv`/`_ref.sv` before each subprocess run,
+  so `run_simulation` has a genuine testbench to exercise during a sweep
+  instead of always skipping.
 - **`test/run_validation.py`** — compiles and simulates each generated
   problem against the dataset's reference solution and testbench, recording
   a real pass/fail — see [Validating generated code](#validating-generated-code)
@@ -326,3 +359,55 @@ extending it:
   (`arith-op-mismatch`) on a file Icarus compiled clean with no warning at
   all — worth trying `verilog_build_tool: slang` on a config you care about
   the strictness of.
+- **Icarus's own runtime error text already carries a failure timestamp for
+  free.** `$fatal`/`$error` both print a `Time: N` line as part of their
+  standard message — confirmed directly (`$fatal` → nonzero exit + `FATAL:`
+  text; `$error` → exit 0 but `ERROR:` text, simulation keeps running; a
+  clean `$finish` → exit 0, neither string present) — so `run_simulation`
+  can anchor its VCD debug window on that timestamp with a plain regex, with
+  no testbench-specific convention required to report *when* something went
+  wrong.
+- **A VCD's raw vector value is genuinely ambiguous without knowing it came
+  from a `b<bits>` dump.** A 4-bit `count` signal at binary `11` renders as
+  the bare digit string `"11"` — indistinguishable from decimal eleven
+  unless you already know it's binary. Caught directly while building the
+  signal-value window: a first version rendered `count=10`/`count=11` for
+  what were actually decimal 2 and 3. `src/vcd.py` tags every value with
+  whether it came from a vector or scalar dump and converts an all-0/1
+  vector to decimal (`0b`-prefixed binary only when it contains `x`/`z`
+  bits, which can't be converted) — an easy trap for any future VCD-reading
+  code to fall back into.
+- **This machine's `iverilog` had a real, silent regression.** conda-forge's
+  v13.0 build refuses to elaborate a `$dumpvars(...)` call that
+  forward-references a wire declared later in the same module — a pattern
+  every verilog-eval testbench uses, so it broke elaboration of the entire
+  dataset with no RTL-side cause at all. Confirmed by replaying a
+  historical, previously-successful `run_validation.py` result
+  byte-for-byte against the same generated code and the same `iverilog`
+  path: it now fails to compile. `iverilog=12.0` (also on conda-forge) does
+  not have this bug. Worth an empirical recheck if `test/run_validation.py`
+  ever reports suspiciously uniform `compile_error`/`unknown` results across
+  a whole run — that's what this regression actually looked like, not a
+  problem with the generated RTL.
+- **"Hide the file" isn't enough to keep a benchmark blind — the VCD debug
+  window leaks just as much, but suppressing it outright breaks debugging
+  entirely.** Making `run_simulation` useful during `run_benchmark.py`
+  sweeps means the testbench needs `RefModule` to even elaborate, but
+  verilog-eval's testbenches dump the reference's own output as a plain
+  top-level `<port>_ref` wire — not nested under the reference instance's
+  own scope, so excluding by instance path (the first approach tried)
+  doesn't catch it. The first fix suppressed the whole VCD window whenever
+  `SIM_EXTRAS_DIR` had any files in it, which stopped the leak but caused
+  real, observed harm: a live benchmark transcript showed the model's own
+  `[Sim Fix Plan]` correctly asking to "read the signal-value table,"
+  finding none, and burning its entire `max_sim_retries` budget confused
+  about a missing testbench instead of fixing an actual NAND-vs-NOR logic
+  bug (`assign out = ~a | ~b` for a *NOR* gate). `run_simulation` now
+  excludes only the `_ref`-suffixed signals (confirmed this convention
+  holds across all 156 dataset problems) rather than the whole window — the
+  model still sees every stimulus input and its own DUT output around the
+  failure, enough to re-derive the right answer from the spec, just never
+  the reference's own computed value. Worth remembering before extending
+  the debug window further: hiding a *file* and hiding a *value derived
+  from that file* are different problems, and VCD dumps routinely do the
+  second without the first.

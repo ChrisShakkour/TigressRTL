@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 generated/
+sim_extras/
 *.egg-info/
 .venv/
 benchmark_runs/

@@ -1,12 +1,19 @@
 import argparse
 import dataclasses
+import re
 import sys
 
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 from config import DEFAULT_CONFIG_PATH, load_config
-from model import build_llm, build_system_prompt, FIX_PLAN_INSTRUCTION, PLANNING_INSTRUCTION
-from tools import BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS
+from model import (
+    build_llm, build_system_prompt, FIX_PLAN_INSTRUCTION, PLANNING_INSTRUCTION,
+    SIM_FIX_PLAN_INSTRUCTION, force_apply_instruction,
+)
+from tools import (
+    BASE_TOOLS, BUILD_FAILURE_PREFIXES, BUILD_TOOL_FUNCTIONS, SIM_FAILURE_PREFIX,
+    make_run_simulation_tool,
+)
 
 # Windows terminals default to a codepage that can't render some characters —
 # force UTF-8 output so nothing gets garbled.
@@ -55,6 +62,17 @@ active_build_tool = BUILD_TOOL_FUNCTIONS[config.verilog_build_tool]
 active_build_tool_name = active_build_tool.name
 build_failure_prefix = BUILD_FAILURE_PREFIXES[config.verilog_build_tool]
 TOOLS = BASE_TOOLS + [active_build_tool]
+
+# run_simulation is only ever built/bound when explicitly enabled — with the
+# flag off, the model never sees it as a callable tool at all (true baseline
+# parity with the pre-simulation agent), not just "auto-chain skipped but
+# still manually callable". A factory, not a bare tool, because the VCD
+# debug window's size is config-driven (sim_debug_window_cycles) but must
+# stay out of the tool's LLM-visible schema — see make_run_simulation_tool.
+if config.enable_simulation:
+    run_simulation = make_run_simulation_tool(config.sim_debug_window_cycles)
+    TOOLS = TOOLS + [run_simulation]
+
 TOOL_FUNCTIONS = {t.name: t for t in TOOLS}
 
 # `llm` is our handle to the model. `.bind_tools(TOOLS)` returns a new
@@ -71,7 +89,80 @@ llm_with_tools = llm.bind_tools(TOOLS)
 #   HumanMessage(...)  - you
 #   AIMessage(...)     - the model's turn (may carry .tool_calls)
 #   ToolMessage(...)   - a tool's result, tagged with which call it answers
-messages = [SystemMessage(content=build_system_prompt(active_build_tool_name))]
+messages = [SystemMessage(content=build_system_prompt(active_build_tool_name, config.enable_simulation))]
+
+_CODE_BLOCK_RE = re.compile(r"```(?:\w+\n)?(.*?)```", re.DOTALL)
+
+
+def _extract_code_block(text: str):
+    match = _CODE_BLOCK_RE.search(text or "")
+    return match.group(1).strip() if match else None
+
+
+def _run_write_auto_chain(file_path: str, write_result: str, action_name: str) -> str:
+    # Shared by the normal tool-dispatch loop below and _force_apply_fix —
+    # same auto-build/auto-simulate enforcement regardless of whether the
+    # write came from a real model tool call or a harness-forced one, so a
+    # forced write is held to exactly the same bar as a normal one.
+    global build_failed, build_retry_count, sim_failed, sim_retry_count, fix_plan_pending, fix_plan_kind
+
+    build_result = active_build_tool.invoke({"file_path": file_path})
+    print("[Auto-Build]", build_result)
+    build_failed = build_result.startswith(build_failure_prefix)
+    extra = f"\n\n[automatically ran {active_build_tool_name} after {action_name}]\n{build_result}"
+
+    if build_failed:
+        fix_plan_pending = True
+        fix_plan_kind = "build"
+        sim_failed = False
+    else:
+        build_retry_count = 0
+        if config.enable_simulation:
+            sim_result = run_simulation.invoke({"file_path": file_path})
+            print("[Auto-Simulate]", sim_result)
+            sim_failed = sim_result.startswith(SIM_FAILURE_PREFIX)
+            if sim_failed:
+                fix_plan_pending = True
+                fix_plan_kind = "sim"
+            else:
+                sim_retry_count = 0
+            extra += (
+                f"\n\n[automatically ran run_simulation after successful "
+                f"{active_build_tool_name}]\n{sim_result}"
+            )
+
+    return f"{write_result}{extra}"
+
+
+def _force_apply_fix(file_path: str) -> bool:
+    # Last resort when the model has repeatedly failed to act on its own
+    # diagnosis (see force_apply_instruction's docstring-style comment in
+    # model.py for why this exists at all — Ollama has no way to force a
+    # tool call). Returns False (meaning: fall back to the plain text nudge)
+    # if the response can't be turned into a real write, so a malformed or
+    # refused response never corrupts the file with garbage.
+    force_response = llm.invoke(messages + [HumanMessage(content=force_apply_instruction(file_path))])
+    accumulate_tokens(token_totals, force_response)
+    print("[Force Apply]", force_response.content, "\n")
+
+    code = _extract_code_block(force_response.content)
+    if code is None:
+        print("[Force Apply] No parseable code block in the response — falling back to a nudge.")
+        return False
+
+    write_result = TOOL_FUNCTIONS["write_file"].invoke({"file_path": file_path, "content": code})
+    print("[Result]", write_result)
+    if not write_result.startswith(("Wrote", "Replaced")):
+        return False
+
+    chained_result = _run_write_auto_chain(file_path, write_result, "write_file")
+    messages.append(AIMessage(content=force_response.content))
+    messages.append(HumanMessage(content=(
+        "You did not call a tool, so the harness extracted the code from "
+        f"your response above and wrote it to {file_path} directly:\n\n{chained_result}"
+    )))
+    return True
+
 
 print("Chatting with", config.model, "— a SystemVerilog RTL design assistant.")
 print("Type 'exit' or 'quit' to stop.\n")
@@ -116,28 +207,51 @@ while True:
     build_failed = False
     build_retry_count = 0
 
-    # Set whenever an auto-build freshly fails (below), so the very next
-    # model turn gets a short, tools-unbound "diagnose and plan the fix"
-    # call first — same structural-guarantee pattern as the initial
-    # PLANNING_INSTRUCTION (a plain llm.invoke() with no tools bound, not a
-    # prompt hope), since local models have been observed diving straight
-    # into another guessed edit without pausing to actually read the error.
-    # Cleared once that plan call has been made, so a retry nudge (model
-    # skipped acting, not a fresh failure) doesn't trigger a second plan
-    # for the same error.
+    # Same bookkeeping as build_failed/build_retry_count above, but for a
+    # simulation that compiled fine and then failed at runtime
+    # ($fatal/$error) — a distinct failure mode with its own retry budget
+    # (config.max_sim_retries). Both stay permanently False/0 (never
+    # touched) when config.enable_simulation is off.
+    sim_failed = False
+    sim_retry_count = 0
+
+    # Set whenever an auto-build or auto-simulation freshly fails (below),
+    # so the very next model turn gets a short, tools-unbound "diagnose and
+    # plan the fix" call first — same structural-guarantee pattern as the
+    # initial PLANNING_INSTRUCTION (a plain llm.invoke() with no tools
+    # bound, not a prompt hope), since local models have been observed
+    # diving straight into another guessed edit without pausing to actually
+    # read the error. Cleared once that plan call has been made, so a retry
+    # nudge (model skipped acting, not a fresh failure) doesn't trigger a
+    # second plan for the same error. fix_plan_kind picks which instruction
+    # applies — a compile error and a runtime failure need different
+    # diagnostic questions, and the two are mutually exclusive at any given
+    # moment (simulation only ever runs once a build has just passed).
     fix_plan_pending = False
+    fix_plan_kind = None  # "build" or "sim"
+
+    # The file a forced-retry fallback (_force_apply_fix) targets if the
+    # model fails to act on its own diagnosis — the most recent file any
+    # write/edit (real or forced) touched this turn. None until the first
+    # successful write, in which case there's nothing to force-apply to.
+    last_write_file_path = None
 
     # Inner loop: the ReAct cycle for this one turn — keep calling the
     # model and executing whatever tools it requests until a response has
     # no more tool_calls, which is the model's final answer for this turn.
     while True:
         if fix_plan_pending:
-            fix_plan_response = llm.invoke(messages + [HumanMessage(content=FIX_PLAN_INSTRUCTION)])
+            if fix_plan_kind == "sim":
+                fix_instruction, fix_label = SIM_FIX_PLAN_INSTRUCTION, "[Sim Fix Plan]"
+            else:
+                fix_instruction, fix_label = FIX_PLAN_INSTRUCTION, "[Fix Plan]"
+            fix_plan_response = llm.invoke(messages + [HumanMessage(content=fix_instruction)])
             accumulate_tokens(token_totals, fix_plan_response)
-            print("[Fix Plan]", fix_plan_response.content, "\n")
+            print(fix_label, fix_plan_response.content, "\n")
             messages.append(fix_plan_response)
             messages.append(HumanMessage(content="Now apply that fix using the available tools."))
             fix_plan_pending = False
+            fix_plan_kind = None
 
         try:
             response = llm_with_tools.invoke(messages)
@@ -175,11 +289,26 @@ while True:
                 build_retry_count += 1
                 print(f"[Retry] Build is still failing and no fix was applied — "
                       f"forcing attempt {build_retry_count}/{config.max_build_retries}.")
+                if last_write_file_path and _force_apply_fix(last_write_file_path):
+                    continue
                 messages.append(HumanMessage(content=(
                     f"The last {active_build_tool_name} result was a failure, and you "
                     "did not call write_file or edit_file_block to actually apply a "
                     "fix — you only described one. Call the appropriate tool now "
                     "with the corrected content."
+                )))
+                continue
+            if sim_failed and sim_retry_count < config.max_sim_retries:
+                sim_retry_count += 1
+                print(f"[Retry] Simulation is still failing and no fix was applied — "
+                      f"forcing attempt {sim_retry_count}/{config.max_sim_retries}.")
+                if last_write_file_path and _force_apply_fix(last_write_file_path):
+                    continue
+                messages.append(HumanMessage(content=(
+                    "The last run_simulation result was a failure, and you did not "
+                    "call write_file or edit_file_block to actually apply a fix — "
+                    "you only described one. Call the appropriate tool now with the "
+                    "corrected content."
                 )))
                 continue
             break  # model gave its final answer for this turn — inner loop ends
@@ -205,18 +334,17 @@ while True:
             # the model sees it whether or not it asked.
             if name in ("write_file", "edit_file_block") and result.startswith(("Wrote", "Replaced")):
                 file_path = call["args"].get("file_path")
-                build_result = active_build_tool.invoke({"file_path": file_path})
-                print("[Auto-Build]", build_result)
-                # Drives the retry check above: a real, current failure sets
-                # this True; a successful build clears it (and resets the
-                # retry count) so a later, unrelated failure gets its own
-                # fresh set of attempts rather than inheriting an old count.
-                build_failed = build_result.startswith(build_failure_prefix)
-                if not build_failed:
-                    build_retry_count = 0
-                else:
-                    fix_plan_pending = True
-                result = f"{result}\n\n[automatically ran {active_build_tool_name} after {name}]\n{build_result}"
+                last_write_file_path = file_path
+                # Drives the retry check above, and the (im)possibility of
+                # a simulation step: see _run_write_auto_chain — a real,
+                # current build failure sets build_failed True; a successful
+                # build clears it (and resets the retry count) so a later,
+                # unrelated failure gets its own fresh set of attempts
+                # rather than inheriting an old count. This *is* the "only
+                # once the build is passing" gate for simulation, enforced
+                # structurally inside the helper, not left to the model's
+                # judgment.
+                result = _run_write_auto_chain(file_path, result, name)
 
             # Print the tool's actual return value directly — never rely on
             # the model's own later paraphrase of it. Models have been

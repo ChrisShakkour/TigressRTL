@@ -6,10 +6,26 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
+from vcd import parse_vcd, render_window
+
 # Where the agent's RTL project lives. Kept separate from the script's own
 # directory so it can be freely cleared/gitignored without touching the
 # actual agent code.
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
+
+# A second, model-invisible project directory — deliberately NOT a
+# subdirectory of GENERATED_DIR, since _resolve_safe_path roots every
+# model-facing tool (write_file/read_file/edit_file_block/list_directory)
+# at GENERATED_DIR and rejects any escape from it; a file living here is
+# therefore structurally unreachable by those tools, not just hidden by
+# convention. Only run_simulation's own compile step reads from it (see
+# _sim_extra_sv_files) — used by test/run_benchmark.py to supply a
+# verilog-eval problem's real _test.sv/_ref.sv so run_simulation has
+# something to simulate against without exposing the reference solution
+# (source *or* its computed output values — see run_simulation's own
+# comment on why the VCD debug window is suppressed whenever this
+# directory is involved) to the model being benchmarked.
+SIM_EXTRAS_DIR = os.path.join(os.path.dirname(__file__), "sim_extras")
 
 # Icarus Verilog's installer (unlike Ollama's) does not add itself to PATH,
 # so a bare "iverilog" call would fail even in a fresh terminal. Check PATH
@@ -27,6 +43,45 @@ _SLANG_FALLBACK = r"C:\slang\slang.exe"
 SLANG_PATH = shutil.which("slang") or (
     _SLANG_FALLBACK if os.path.exists(_SLANG_FALLBACK) else "slang"
 )
+
+# vvp (Icarus's simulation runtime) ships alongside iverilog itself — same
+# PATH-then-fallback lookup, same installer caveat.
+_VVP_FALLBACK = r"C:\iverilog\bin\vvp.exe"
+VVP_PATH = shutil.which("vvp") or (
+    _VVP_FALLBACK if os.path.exists(_VVP_FALLBACK) else "vvp"
+)
+
+# Icarus's own $fatal/$error runtime messages always carry this — e.g.
+# "FATAL: foo.sv:4: something broke\n       Time: 1400  Scope: foo_tb" —
+# giving run_simulation a failure timestamp for free, with no
+# testbench-specific convention required to anchor the VCD debug window on.
+_SIM_TIME_RE = re.compile(r"Time:\s*(\d+)")
+
+# Same pattern test/run_validation.py's own MISMATCH_RE matches against
+# verilog-eval's testbenches. Confirmed directly this convention is
+# necessary, not optional: those testbenches never call $error/$fatal at
+# all — they only ever $display a "Mismatches: N in M samples" summary from
+# a `final` block, so the runtime-error heuristic alone silently reported
+# every verilog-eval problem as a pass regardless of whether TopModule was
+# actually right, until this was added.
+_SIM_MISMATCH_RE = re.compile(r"Mismatches:\s*(\d+)\s+in\s+(\d+)\s+samples")
+
+# verilog-eval's own Hint text (not an Icarus built-in, unlike _SIM_TIME_RE's
+# "Time: N" -- this is specific to the "Mismatches:" convention above) is
+# the only place a timestamp appears for a pure functional-mismatch failure,
+# since those never call $error/$fatal at all, so _SIM_TIME_RE never matches
+# them. Without this, a verilog-eval functional mismatch would get no VCD
+# debug window at all, regardless of extra_files filtering.
+_SIM_MISMATCH_TIME_RE = re.compile(r"first mismatch occurred at time\s+(\d+)", re.IGNORECASE)
+
+# verilog-eval's testbenches dump the hidden reference module's own output
+# through a plain top-level wire named "<port>_ref" sitting right next to
+# the DUT's "<port>_dut" -- not nested under the reference instance's own
+# scope, so excluding by instance path (the first approach tried) wouldn't
+# catch it. Confirmed directly: every one of the 156 test files in the
+# dataset follows this exact "_ref"/"_dut" suffix convention, so this is a
+# reliable (if dataset-specific) filter, not a generic Verilog-parsing one.
+_HIDDEN_REFERENCE_SUFFIXES = ("_ref",)
 
 
 # Matches the start of one diagnostic from either tool: slang's
@@ -75,6 +130,16 @@ def _project_sv_files() -> list[str]:
     # not compiled as standalone top-level units.
     base = Path(GENERATED_DIR).resolve()
     return sorted(str(p) for p in base.rglob("*.sv"))
+
+
+def _sim_extra_sv_files() -> list[str]:
+    # Mirrors _project_sv_files(), rooted at SIM_EXTRAS_DIR instead —
+    # returns [] whenever nothing has populated that directory (the normal
+    # case for interactive use; only test/run_benchmark.py ever writes here).
+    base = Path(SIM_EXTRAS_DIR)
+    if not base.exists():
+        return []
+    return sorted(str(p) for p in base.resolve().rglob("*.sv"))
 
 
 def _resolve_safe_path(path: str) -> Path:
@@ -257,6 +322,146 @@ def lint_verilog(file_path: str) -> str:
         return f"Lint of {file_path} timed out after 30s."
     except (OSError, ValueError) as e:
         return f"Failed to lint {file_path}: {e}"
+
+
+SIM_FAILURE_PREFIX = "Simulation failed"
+
+
+def _project_has_testbench() -> bool:
+    # Synthesizable RTL never legitimately calls $finish (it's a
+    # simulation-only system task) — so any project .sv file that does is
+    # reliably "a testbench exists", with no naming convention required.
+    # Checks SIM_EXTRAS_DIR too — a benchmark-supplied testbench living
+    # there counts just as much as one the model wrote itself.
+    return any(
+        "$finish" in Path(f).read_text(encoding="utf-8")
+        for f in [*_project_sv_files(), *_sim_extra_sv_files()]
+    )
+
+
+def make_run_simulation_tool(debug_window_cycles: int):
+    # A factory rather than a bare @tool function because the rendered VCD
+    # window's size is config-driven (AgentConfig.sim_debug_window_cycles)
+    # but must stay out of the tool's LLM-visible schema, which only ever
+    # takes file_path — rtl_agent.py calls this once at startup with the
+    # active config, the same place active_build_tool is resolved from
+    # config.verilog_build_tool.
+    @tool
+    def run_simulation(file_path: str) -> str:
+        """Compile the whole project — together with every other .sv file in it — into a runnable simulation with Icarus Verilog and execute it with vvp, returning the real simulation log. Only produces a meaningful result once a self-checking testbench (a file that calls $finish) exists in the project."""
+        try:
+            target = _resolve_safe_path(file_path)
+            if not target.exists():
+                return f"File not found: {file_path}"
+
+            if not _project_has_testbench():
+                return (
+                    "Simulation skipped: no testbench found in the project "
+                    "(no .sv file calls $finish) — write one that drives the "
+                    "design and calls $finish before running a simulation."
+                )
+
+            # Unlike build_verilog's -t null (elaborate-only), this needs a
+            # real runnable target — same iverilog -o + vvp mechanics
+            # test/run_validation.py already uses offline against the
+            # verilog-eval dataset, just against whatever testbench is in
+            # the project instead of an external one. extra_files (from
+            # SIM_EXTRAS_DIR, never build_verilog/lint_verilog's own compile)
+            # lets a benchmark-supplied testbench elaborate against its own
+            # reference module without that module ever being visible to
+            # the model via write_file/read_file/list_directory.
+            extra_files = _sim_extra_sv_files()
+            sim_exe = Path(GENERATED_DIR) / "sim.vvp"
+            compile_result = subprocess.run(
+                [IVERILOG_PATH, "-g2012", "-o", str(sim_exe), *_project_sv_files(), *extra_files],
+                capture_output=True, text=True, timeout=30,
+            )
+            if compile_result.returncode != 0:
+                log = (compile_result.stdout + _truncate_diagnostics(compile_result.stderr)).strip()
+                return f"{SIM_FAILURE_PREFIX} to compile (exit code {compile_result.returncode}):\n{log}"
+
+            # cwd=GENERATED_DIR so a testbench's relative
+            # $dumpfile("wave.vcd") lands next to the design instead of
+            # wherever this process happened to be launched from.
+            sim_result = subprocess.run(
+                [VVP_PATH, str(sim_exe)],
+                capture_output=True, text=True, timeout=30, cwd=GENERATED_DIR,
+            )
+            log = (sim_result.stdout + sim_result.stderr).strip()
+
+            # Runtime-error heuristic (empirically verified against this
+            # exact iverilog/vvp): $fatal -> nonzero exit + "FATAL:" text;
+            # $error -> exit 0 but "ERROR:" text, simulation keeps running;
+            # a clean $finish -> exit 0, neither string present.
+            is_runtime_error = sim_result.returncode != 0 or "ERROR:" in log or "FATAL:" in log
+
+            # A second, independent failure signal: verilog-eval's
+            # testbenches (used via SIM_EXTRAS_DIR — see
+            # test/run_benchmark.py) never call $error/$fatal at all, only
+            # $display a "Mismatches: N in M samples" summary from a `final`
+            # block — the runtime-error heuristic alone can't see this at
+            # all, and would otherwise report every one of those as a clean
+            # pass regardless of whether the design was actually right.
+            mismatch_match = _SIM_MISMATCH_RE.search(log)
+            has_mismatches = bool(mismatch_match) and int(mismatch_match.group(1)) > 0
+
+            if not (is_runtime_error or has_mismatches):
+                return log or "Simulation ran to completion with no output."
+
+            if is_runtime_error:
+                message = f"{SIM_FAILURE_PREFIX} (runtime error):\n{log}"
+            else:
+                message = f"{SIM_FAILURE_PREFIX} (functional mismatch):\n{log}"
+
+            # Best-effort debug context: the timestamp and the VCD are both
+            # optional extras, never required for the failure itself to be
+            # reported — a missing/unparseable one just means no window is
+            # appended, not an error. Try $fatal/$error's own "Time: N"
+            # first; a pure functional mismatch never has one, so fall back
+            # to verilog-eval's own "first mismatch occurred at time N" text.
+            time_match = _SIM_TIME_RE.search(log) or _SIM_MISMATCH_TIME_RE.search(log)
+            vcd_path = Path(GENERATED_DIR) / "wave.vcd"
+            if time_match and vcd_path.exists():
+                try:
+                    trace = parse_vcd(vcd_path)
+                    # extra_files means a hidden reference module is part of
+                    # this compile (see SIM_EXTRAS_DIR) — its own output is
+                    # dumped as a plain "<port>_ref" wire right next to the
+                    # DUT's "<port>_dut" (confirmed across the whole
+                    # dataset), so exclude it from the rendered window
+                    # rather than suppressing the whole window: the model
+                    # still gets real stimulus/DUT-output values to debug
+                    # from, just never the reference's computed answer.
+                    exclude = _HIDDEN_REFERENCE_SUFFIXES if extra_files else None
+                    window = render_window(
+                        trace, int(time_match.group(1)), debug_window_cycles,
+                        exclude_leaf_suffixes=exclude,
+                    )
+                    message += (
+                        f"\n\nSignal values around the failure "
+                        f"(+/-{debug_window_cycles} clock cycles):\n{window}"
+                    )
+                except (OSError, ValueError):
+                    pass
+            return message
+
+        except FileNotFoundError:
+            # Raised if IVERILOG_PATH/VVP_PATH itself can't be executed at
+            # all (not just a compile/runtime error in the .sv files).
+            return (
+                "iverilog/vvp is not installed or could not be found. Install it via "
+                "`winget install Icarus.Verilog` (Windows) or your package "
+                "manager, and note the installer may not add it to PATH."
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                f"{SIM_FAILURE_PREFIX}: timed out after 30s — check for a "
+                "missing $finish or an infinite loop."
+            )
+        except (OSError, ValueError) as e:
+            return f"Failed to simulate {file_path}: {e}"
+
+    return run_simulation
 
 
 @tool

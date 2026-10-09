@@ -32,7 +32,7 @@ TOKEN_USAGE_RE = re.compile(
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from config import DEFAULT_CONFIG_PATH, load_config  # noqa: E402
-from tools import GENERATED_DIR  # noqa: E402
+from tools import GENERATED_DIR, SIM_EXTRAS_DIR  # noqa: E402
 
 
 def parse_args():
@@ -88,8 +88,8 @@ def discover_problems(dataset_dir: Path) -> list[str]:
     return [p.name[: -len("_prompt.txt")] for p in prompt_files]
 
 
-def clear_generated_dir(generated_dir: str) -> None:
-    path = Path(generated_dir)
+def clear_dir(dir_path: str) -> None:
+    path = Path(dir_path)
     if not path.exists():
         return
     for entry in path.iterdir():
@@ -97,6 +97,21 @@ def clear_generated_dir(generated_dir: str) -> None:
             shutil.rmtree(entry)
         else:
             entry.unlink()
+
+
+def populate_sim_extras(sim_extras_dir: str, dataset_dir: Path, problem: str) -> None:
+    # Copies the dataset's own _test.sv/_ref.sv into SIM_EXTRAS_DIR — a
+    # directory run_simulation's compile step reads from but write_file/
+    # read_file/list_directory can never reach (see tools.py's
+    # SIM_EXTRAS_DIR comment) — so the agent gets a real simulation result
+    # against verilog-eval's actual testbench without ever being able to
+    # browse or read the reference solution it depends on to elaborate.
+    # Only called for configs with enable_simulation: true; a config
+    # without it never even looks at this directory.
+    for suffix in ("_test.sv", "_ref.sv"):
+        src = dataset_dir / f"{problem}{suffix}"
+        if src.exists():
+            shutil.copy2(src, Path(sim_extras_dir) / src.name)
 
 
 def copy_generated_outputs(generated_dir: str, dest: Path) -> int:
@@ -144,7 +159,14 @@ def run_one(python: str, config_path: Path, prompt_single_line: str, timeout: fl
         returncode = proc.returncode
         status = "completed"
     except subprocess.TimeoutExpired as e:
-        log = (e.stdout or "") + (e.stderr or "")
+        # text=True/encoding="utf-8" normally guarantees str, but on an
+        # actual timeout the partial output captured before the kill can
+        # come back as raw bytes instead (a subprocess quirk, not specific
+        # to this script) -- decode defensively so one slow problem times
+        # out cleanly instead of crashing the whole sweep.
+        def _to_text(x):
+            return x.decode("utf-8", errors="replace") if isinstance(x, bytes) else (x or "")
+        log = _to_text(e.stdout) + _to_text(e.stderr)
         returncode = None
         status = "timeout"
     except OSError as e:
@@ -262,7 +284,11 @@ def main():
             single_line = " ".join(raw.split())
             (problem_dir / "prompt.txt").write_text(single_line, encoding="utf-8")
 
-            clear_generated_dir(GENERATED_DIR)
+            clear_dir(GENERATED_DIR)
+            clear_dir(SIM_EXTRAS_DIR)
+            if cfg.enable_simulation:
+                Path(SIM_EXTRAS_DIR).mkdir(parents=True, exist_ok=True)
+                populate_sim_extras(SIM_EXTRAS_DIR, dataset_dir, problem)
 
             status, returncode, log, duration = run_one(args.python, config_path, single_line, args.timeout)
 

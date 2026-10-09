@@ -53,6 +53,24 @@ class AgentConfig:
     # they're never both exposed together.
     verilog_build_tool: str = "icarus"
 
+    # Whether run_simulation (src/tools.py) is bound to the model at all and
+    # auto-chained after a successful build (rtl_agent.py). Defaults to
+    # False so every existing config file reproduces today's exact
+    # behavior — build-only, no simulation — with zero changes; set True in
+    # a separate config to A/B this feature against that unchanged baseline.
+    enable_simulation: bool = False
+
+    # Bounded retry cap for the simulation-failure nudge in rtl_agent.py,
+    # same role as max_build_retries but for a runtime (not compile)
+    # failure. Unused when enable_simulation is False.
+    max_sim_retries: int = 3
+
+    # How many clock cycles of context (before and after) to show around a
+    # simulation failure's timestamp, when run_simulation renders a
+    # VCD-derived signal-value window (src/vcd.py's render_window). Unused
+    # when enable_simulation is False.
+    sim_debug_window_cycles: int = 3
+
     def __post_init__(self):
         # Not imported from tools.py's BUILD_TOOL_FUNCTIONS keys on purpose —
         # that would pull langchain_core/subprocess into config.py just for

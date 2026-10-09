@@ -1,0 +1,11 @@
+model: devstral-small-2
+num_ctx: 16384
+max_build_retries: 6
+verilog_build_tool: slang
+
+# The only real differences from configs/default.yaml — everything above
+# is copied verbatim from it so this is a clean single-variable A/B
+# comparison, not also swapping build tool/context/retries at the same time.
+enable_simulation: true
+max_sim_retries: 6
+sim_debug_window_cycles: 3
