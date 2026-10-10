@@ -1,0 +1,6 @@
+# Same as default.yaml but using Icarus Verilog (a real compiler) instead
+# of Slang as the build/lint backend — see configs/README.md#build-tools.
+model: devstral-small-2
+num_ctx: 8192
+max_build_retries: 3
+verilog_build_tool: icarus
