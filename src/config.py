@@ -46,6 +46,17 @@ class AgentConfig:
     # would loop forever.
     max_build_retries: int = 3
 
+    # Hard cap on tool-calling steps within a single user turn in
+    # rtl_agent.py's inner ReAct loop. max_build_retries only bounds the
+    # narrow case of "auto-build just failed and the model didn't apply a
+    # fix" — it does nothing for a model that loops on read_file/
+    # list_directory calls without ever writing or finishing. This is the
+    # general backstop: independent of *why* the loop hasn't ended, once
+    # this many steps have passed the agent forces one final tools-unbound
+    # call asking the model to summarize progress and stop, rather than
+    # continuing indefinitely.
+    max_iterations: int = 40
+
     # Which build/lint backend the agent's build tool uses — "icarus"
     # (Icarus Verilog, src/tools.py's build_verilog) or "slang"
     # (sv-lang.com, build_verilog's structural sibling lint_verilog).

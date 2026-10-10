@@ -236,10 +236,34 @@ while True:
     # successful write, in which case there's nothing to force-apply to.
     last_write_file_path = None
 
+    # Counts every pass through the inner loop below (a fix-plan call plus
+    # a main call both count as one pass) — the general backstop against a
+    # runaway turn, independent of build_retry_count above which only
+    # covers the narrow "auto-build just failed" case. See
+    # config.max_iterations in config.py for why this exists separately.
+    iteration_count = 0
+
     # Inner loop: the ReAct cycle for this one turn — keep calling the
     # model and executing whatever tools it requests until a response has
     # no more tool_calls, which is the model's final answer for this turn.
     while True:
+        if iteration_count >= config.max_iterations:
+            print(f"[Iteration Cap] Reached max_iterations={config.max_iterations} for "
+                  "this turn without a final answer — stopping to avoid a runaway loop.")
+            messages.append(HumanMessage(content=(
+                f"You've reached the maximum of {config.max_iterations} tool-calling "
+                "steps for this request without giving a final answer. Stop here: "
+                "summarize your progress and what's left, rather than continuing."
+            )))
+            # One last tools-unbound call so the model can actually produce
+            # that summary — same structural guarantee as PLANNING_INSTRUCTION,
+            # it cannot request another tool call and re-enter the loop.
+            cap_response = llm.invoke(messages)
+            accumulate_tokens(token_totals, cap_response)
+            messages.append(cap_response)
+            break
+        iteration_count += 1
+
         if fix_plan_pending:
             if fix_plan_kind == "sim":
                 fix_instruction, fix_label = SIM_FIX_PLAN_INSTRUCTION, "[Sim Fix Plan]"
